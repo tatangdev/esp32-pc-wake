@@ -47,12 +47,31 @@ sudo usermod -aG dialout $USER
 - uses telegram long polling (20s), so commands arrive almost instantly without polling all the time.
 - only uses outbound HTTPS. no incoming ports, VPN endpoint or the Dokploy VPS needed.
 
+## Testing status
+
+tested on a real ESP32-WROOM-32 (CH340 USB) with core 3.3.12, ArduinoJson 7.4.3 and a windows 11 Pro PC:
+
+- compile and upload with arduino-cli from WSL2 (usbipd)
+- wifi connect, NTP sync and telegram long polling
+- `/status`, including the RDP check (`PC: RDP reachable`)
+- `/wake` when the PC is already on (`PC already online`)
+- WoL from shutdown
+- retry and backoff during real telegram network failures (`-1`, `-5`, `-11`)
+
+not tested yet:
+
+- `/wake` from shutdown all the way to the `PC ready: RDP reachable` message
+- recovery after the wifi or router goes down
+- the 5 minute restart when telegram stays unreachable
+- the outbox, and the no-resend rule when a reply is lost (needs a network failure at the exact moment a reply is sent)
+- WoL after a power outage (many boards ignore WoL until the PC is turned on once)
+- long-run stability over days
+
 ## Limitations
 
-- **not tested on real hardware yet.** it compiles on core 3.3.12 with ArduinoJson 7.4.3, but still need to check first boot, recovery after wifi goes down, and long-run stability on the actual ESP32.
 - the telegram reply only means the WoL *packet was sent*, not that the PC really booted. RDP reachable only means the service can be reached, and unreachable doesn't mean the PC is off.
 - if home internet, router, wifi or ESP32 power is down, remote commands won't work.
-- connections to telegram can fail in short bursts on some ISPs (resets or timeouts). failed calls are retried 3 times, and replies that still fail wait in an outbox and are retried every 10s for up to 3 minutes, so a reply can arrive late.
+- connections to telegram can fail in short bursts on some ISPs (resets or timeouts). failed calls are retried 3 times, and replies that still fail wait in an outbox and are retried every 10s for up to 3 minutes, so a reply can arrive late. if a reply was sent but telegram's response got lost, it's not sent again (to avoid duplicates), so in rare cases a reply can be missing.
 - HTTPS calls are blocking, and a long poll can hold the loop for up to 20s. the watchdog restarts the device if it gets really stuck, and it also restarts if telegram or the clock sync fails for 5 minutes.
 - TLS uses `TELEGRAM_CERTIFICATE_ROOT` from the installed UniversalTelegramBot library. update the library if telegram changes its CA chain.
 - the getUpdates reply is parsed from the stream with a filter and only 1 update per call, so a big message can't block the bot.
