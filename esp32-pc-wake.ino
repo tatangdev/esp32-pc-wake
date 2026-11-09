@@ -19,7 +19,8 @@ constexpr uint32_t WIFI_RETRY_MS = 10000;
 constexpr uint32_t WDT_TIMEOUT_MS = 60000;
 constexpr uint32_t RESTART_AFTER_MS = 300000;
 constexpr uint32_t WAKE_COOLDOWN_MS = 30000;
-constexpr uint32_t BOOT_CHECK_INTERVAL_MS = 5000;
+constexpr uint32_t BOOT_CHECK_DELAY_MS = 20000; // the PC boots in about 20s
+constexpr uint32_t BOOT_CHECK_INTERVAL_MS = 3000;
 constexpr uint32_t BOOT_CHECK_MAX_MS = 180000;
 constexpr uint32_t HEALTH_LOG_MS = 60000;
 constexpr uint32_t OUTBOX_RETRY_MS = 10000;
@@ -47,7 +48,7 @@ uint32_t failTotal = 0;
 uint32_t lastFailAt = 0;
 uint32_t lastWakeAt = 0;
 uint32_t bootCheckStartedAt = 0;
-uint32_t lastBootCheckAt = 0;
+uint32_t nextBootCheckAt = 0;
 bool wifiUp = false;
 bool wakeSent = false;
 bool bootCheckActive = false;
@@ -184,7 +185,8 @@ void flushOutbox() {
 
 void startBootCheck() {
   bootCheckActive = true;
-  bootCheckStartedAt = lastBootCheckAt = millis();
+  bootCheckStartedAt = millis();
+  nextBootCheckAt = millis() + BOOT_CHECK_DELAY_MS;
 }
 
 void wakeCommand() {
@@ -270,11 +272,11 @@ void pollTelegram() {
 }
 
 void checkBootProgress() {
-  if (!bootCheckActive || !wifiUp || millis() - lastBootCheckAt < BOOT_CHECK_INTERVAL_MS) return;
-  lastBootCheckAt = millis();
+  if (!bootCheckActive || !wifiUp || !due(nextBootCheckAt)) return;
+  nextBootCheckAt = millis() + BOOT_CHECK_INTERVAL_MS;
   if (rdpReachable()) {
     bootCheckActive = false;
-    sendMessage("PC ready: RDP reachable.");
+    sendMessage("PC is on (RDP reachable).");
   } else if (millis() - bootCheckStartedAt >= BOOT_CHECK_MAX_MS) {
     bootCheckActive = false;
     sendMessage("WoL sent, but RDP is still unreachable after 3 minutes.");
