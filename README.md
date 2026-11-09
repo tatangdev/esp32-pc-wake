@@ -52,6 +52,7 @@ sudo usermod -aG dialout $USER
 - **not tested on real hardware yet.** it compiles on core 3.3.12 with ArduinoJson 7.4.3, but still need to check first boot, recovery after wifi goes down, and long-run stability on the actual ESP32.
 - the telegram reply only means the WoL *packet was sent*, not that the PC really booted. RDP reachable only means the service can be reached, and unreachable doesn't mean the PC is off.
 - if home internet, router, wifi or ESP32 power is down, remote commands won't work.
+- connections to telegram can fail in short bursts on some ISPs (resets or timeouts). failed calls are retried 3 times, and replies that still fail wait in an outbox and are retried every 10s for up to 3 minutes, so a reply can arrive late.
 - HTTPS calls are blocking, and a long poll can hold the loop for up to 20s. the watchdog restarts the device if it gets really stuck, and it also restarts if telegram or the clock sync fails for 5 minutes.
 - TLS uses `TELEGRAM_CERTIFICATE_ROOT` from the installed UniversalTelegramBot library. update the library if telegram changes its CA chain.
 - the getUpdates reply is parsed from the stream with a filter and only 1 update per call, so a big message can't block the bot.

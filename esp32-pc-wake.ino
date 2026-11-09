@@ -22,6 +22,8 @@ constexpr uint32_t WAKE_COOLDOWN_MS = 30000;
 constexpr uint32_t BOOT_CHECK_INTERVAL_MS = 5000;
 constexpr uint32_t BOOT_CHECK_MAX_MS = 90000;
 constexpr uint32_t HEALTH_LOG_MS = 60000;
+constexpr uint32_t OUTBOX_RETRY_MS = 10000;
+constexpr uint32_t OUTBOX_MAX_AGE_MS = 180000;
 constexpr int64_t MAX_COMMAND_AGE_SEC = 90;
 
 const int64_t OWNER_ID = strtoll(AUTHORIZED_USER_ID, nullptr, 10);
@@ -42,24 +44,29 @@ uint32_t lastHealthLog = 0;
 uint32_t failingSince = 0;
 uint32_t failStreak = 0;
 uint32_t failTotal = 0;
+uint32_t lastFailAt = 0;
 uint32_t lastWakeAt = 0;
 uint32_t bootCheckStartedAt = 0;
 uint32_t lastBootCheckAt = 0;
 bool wifiUp = false;
 bool wakeSent = false;
 bool bootCheckActive = false;
+String outbox;
+uint32_t outboxSince = 0;
+uint32_t outboxNextTry = 0;
 
 bool due(uint32_t at) { return (int32_t)(millis() - at) >= 0; }
 
 bool clockValid() { return time(nullptr) >= 1700000000; }
 
-String uptimeText() {
-  uint32_t s = esp_timer_get_time() / 1000000ULL;
+String durationText(uint32_t s) {
   if (s < 60) return String(s) + "s";
   if (s < 3600) return String(s / 60) + "m";
   if (s < 86400) return String(s / 3600) + "h " + String(s / 60 % 60) + "m";
   return String(s / 86400) + "d " + String(s / 3600 % 24) + "h";
 }
+
+String uptimeText() { return durationText(esp_timer_get_time() / 1000000ULL); }
 
 bool rdpReachable() {
   if (!pcCheckEnabled || WiFi.status() != WL_CONNECTED) return false;
@@ -91,15 +98,22 @@ DeserializationError readUpdates(JsonDocument &reply) {
 }
 
 // the TLS connection is kept open between calls, so most calls skip the handshake.
-// retry once on a transport error, because the kept connection can be dropped anytime.
+// network errors are retried a few times, because the kept connection can be dropped anytime.
+bool callFailed() {
+  failTotal++;
+  lastFailAt = millis();
+  return false;
+}
+
 bool telegramCall(const char *method, const JsonDocument &body, uint32_t timeoutMs,
                   JsonDocument *reply = nullptr) {
   String payload;
   serializeJson(body, payload);
-  for (int attempt = 0; attempt < 2; attempt++) {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt) delay(attempt * 1000);
     if (WiFi.status() != WL_CONNECTED) return false;
     esp_task_wdt_reset();
-    if (!http.begin(tls, API_URL + method)) return false;
+    if (!http.begin(tls, API_URL + method)) return callFailed();
     http.setTimeout(timeoutMs);
     http.addHeader("Content-Type", "application/json");
     int code = http.POST(payload);
@@ -114,16 +128,40 @@ bool telegramCall(const char *method, const JsonDocument &body, uint32_t timeout
     if (ok) return true;
     Serial.printf("telegram %s failed, http=%d\n", method, code);
     tls.stop();
-    if (code > 0) return false;
+    if (code > 0) break;
   }
-  return false;
+  return callFailed();
 }
 
-bool sendMessage(const String &text) {
+bool postMessage(const String &text) {
   JsonDocument body;
   body["chat_id"] = OWNER_ID;
   body["text"] = text;
   return telegramCall("sendMessage", body, HTTP_TIMEOUT_MS);
+}
+
+// a message that can't be sent goes to the outbox and is retried later, so replies aren't lost
+void sendMessage(const String &text) {
+  if (outbox.length()) {
+    outbox += "\n\n" + text; // keep the order behind the waiting message
+    return;
+  }
+  if (postMessage(text)) return;
+  outbox = text;
+  outboxSince = millis();
+  outboxNextTry = millis() + OUTBOX_RETRY_MS;
+}
+
+void flushOutbox() {
+  if (!outbox.length() || !wifiUp || !due(outboxNextTry)) return;
+  if (postMessage(outbox)) {
+    outbox = "";
+  } else if (millis() - outboxSince >= OUTBOX_MAX_AGE_MS) {
+    Serial.println("outbox dropped after 3m");
+    outbox = "";
+  } else {
+    outboxNextTry = millis() + OUTBOX_RETRY_MS;
+  }
 }
 
 void startBootCheck() {
@@ -155,7 +193,8 @@ String statusText() {
   s += "Wi-Fi: " + String(WiFi.RSSI()) + " dBm, IP " + WiFi.localIP().toString() + "\n";
   s += "Uptime: " + uptimeText() + "\n";
   s += "Free heap: " + String(ESP.getFreeHeap() / 1024) + " KB\n";
-  s += "Telegram failures since boot: " + String(failTotal) + "\n";
+  if (failTotal) s += "Telegram: " + String(failTotal) + " failed calls, last " + durationText((millis() - lastFailAt) / 1000) + " ago\n";
+  else s += "Telegram: no failed calls\n";
   if (!pcCheckEnabled) s += "PC: RDP check not configured";
   else s += rdpReachable() ? "PC: RDP reachable" : "PC: RDP unreachable (power unknown)";
   return s;
@@ -169,7 +208,6 @@ void handleCommand(const String &cmd) {
 
 void pollFailed(const char *reason) {
   failStreak++;
-  failTotal++;
   if (!failingSince) failingSince = millis();
   Serial.printf("poll failed (%s), streak=%lu\n", reason, (unsigned long)failStreak);
   if (millis() - failingSince >= RESTART_AFTER_MS) {
@@ -285,6 +323,7 @@ void setup() {
     Serial.printf("wifi disconnected, reason=%d\n", info.wifi_sta_disconnected.reason);
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // modem sleep can delay or drop incoming packets
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWifiAttempt = millis();
@@ -295,11 +334,12 @@ void loop() {
   esp_task_wdt_reset();
   wifiMaintain();
   pollTelegram();
+  flushOutbox();
   checkBootProgress();
   if (millis() - lastHealthLog >= HEALTH_LOG_MS) {
     lastHealthLog = millis();
-    Serial.printf("[health] uptime=%s wifi=%d heap=%lu fails=%lu\n", uptimeText().c_str(),
-      wifiUp, (unsigned long)ESP.getFreeHeap(), (unsigned long)failTotal);
+    Serial.printf("[health] uptime=%s rssi=%d heap=%lu fails=%lu\n", uptimeText().c_str(),
+      wifiUp ? WiFi.RSSI() : 0, (unsigned long)ESP.getFreeHeap(), (unsigned long)failTotal);
   }
   delay(20);
 }
