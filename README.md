@@ -40,7 +40,7 @@ sudo usermod -aG dialout $USER
 
 ## Behavior
 
-- `/wake`: sends a magic packet. if the RDP IP is set, it checks first if RDP is already reachable, and after sending it watches the boot for up to 90 seconds.
+- `/wake`: sends a magic packet. if the RDP IP is set, it checks first if RDP is already reachable, and after sending it watches the boot for up to 3 minutes. the magic packet is sent 3 times, and the RDP check tries 2 times before saying unreachable.
 - `/status`: shows ESP32 wifi, uptime, memory, telegram stats, and RDP reachability (if set).
 - `/help`: list of commands.
 - only one user (`AUTHORIZED_USER_ID`) can use the bot. any other text gets the command list.

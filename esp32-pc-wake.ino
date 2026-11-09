@@ -20,7 +20,7 @@ constexpr uint32_t WDT_TIMEOUT_MS = 60000;
 constexpr uint32_t RESTART_AFTER_MS = 300000;
 constexpr uint32_t WAKE_COOLDOWN_MS = 30000;
 constexpr uint32_t BOOT_CHECK_INTERVAL_MS = 5000;
-constexpr uint32_t BOOT_CHECK_MAX_MS = 90000;
+constexpr uint32_t BOOT_CHECK_MAX_MS = 180000;
 constexpr uint32_t HEALTH_LOG_MS = 60000;
 constexpr uint32_t OUTBOX_RETRY_MS = 10000;
 constexpr uint32_t OUTBOX_MAX_AGE_MS = 180000;
@@ -68,12 +68,16 @@ String durationText(uint32_t s) {
 
 String uptimeText() { return durationText(esp_timer_get_time() / 1000000ULL); }
 
+// 2 tries, so one lost packet doesn't report the PC as unreachable
 bool rdpReachable() {
   if (!pcCheckEnabled || WiFi.status() != WL_CONNECTED) return false;
-  WiFiClient tcp;
-  bool ok = tcp.connect(pcIp, PC_RDP_PORT, 1000);
-  tcp.stop();
-  return ok;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    WiFiClient tcp;
+    bool ok = tcp.connect(pcIp, PC_RDP_PORT, 1000);
+    tcp.stop();
+    if (ok) return true;
+  }
+  return false;
 }
 
 bool sendWol() {
@@ -82,9 +86,14 @@ bool sendWol() {
   memset(packet, 0xff, 6);
   for (int i = 0; i < 16; i++) memcpy(packet + 6 + i * 6, PC_MAC, 6);
   IPAddress broadcast = WiFi.broadcastIP();
-  bool sent = udp.beginPacket(broadcast, WOL_PORT) &&
-              udp.write(packet, sizeof(packet)) == sizeof(packet) &&
-              udp.endPacket();
+  // UDP has no delivery check, so send it a few times
+  bool sent = false;
+  for (int i = 0; i < 3; i++) {
+    if (i) delay(100);
+    sent |= udp.beginPacket(broadcast, WOL_PORT) &&
+            udp.write(packet, sizeof(packet)) == sizeof(packet) &&
+            udp.endPacket();
+  }
   Serial.printf("WoL %s, broadcast=%s\n", sent ? "sent" : "failed", broadcast.toString().c_str());
   return sent;
 }
@@ -97,16 +106,18 @@ DeserializationError readUpdates(JsonDocument &reply) {
   return deserializeJson(reply, raw, filter);
 }
 
-// the TLS connection is kept open between calls, so most calls skip the handshake.
-// network errors are retried a few times, because the kept connection can be dropped anytime.
 bool callFailed() {
   failTotal++;
   lastFailAt = millis();
   return false;
 }
 
+// the TLS connection is kept open between calls, so most calls skip the handshake.
+// network errors are retried a few times, because the kept connection can be dropped anytime.
+// with maybeSent set, a call that already reached telegram (reply lost) is not retried,
+// so a message isn't posted twice.
 bool telegramCall(const char *method, const JsonDocument &body, uint32_t timeoutMs,
-                  JsonDocument *reply = nullptr) {
+                  JsonDocument *reply = nullptr, bool *maybeSent = nullptr) {
   String payload;
   serializeJson(body, payload);
   for (int attempt = 0; attempt < 3; attempt++) {
@@ -129,6 +140,10 @@ bool telegramCall(const char *method, const JsonDocument &body, uint32_t timeout
     Serial.printf("telegram %s failed, http=%d\n", method, code);
     tls.stop();
     if (code > 0) break;
+    if (maybeSent && (code == HTTPC_ERROR_CONNECTION_LOST || code == HTTPC_ERROR_READ_TIMEOUT)) {
+      *maybeSent = true;
+      break;
+    }
   }
   return callFailed();
 }
@@ -137,7 +152,10 @@ bool postMessage(const String &text) {
   JsonDocument body;
   body["chat_id"] = OWNER_ID;
   body["text"] = text;
-  return telegramCall("sendMessage", body, HTTP_TIMEOUT_MS);
+  bool maybeSent = false;
+  if (telegramCall("sendMessage", body, HTTP_TIMEOUT_MS, nullptr, &maybeSent)) return true;
+  if (maybeSent) Serial.println("sendMessage reply lost, probably delivered, not resending");
+  return maybeSent;
 }
 
 // a message that can't be sent goes to the outbox and is retried later, so replies aren't lost
@@ -259,7 +277,7 @@ void checkBootProgress() {
     sendMessage("PC ready: RDP reachable.");
   } else if (millis() - bootCheckStartedAt >= BOOT_CHECK_MAX_MS) {
     bootCheckActive = false;
-    sendMessage("WoL sent, but RDP is still unreachable after 90 seconds.");
+    sendMessage("WoL sent, but RDP is still unreachable after 3 minutes.");
   }
 }
 
